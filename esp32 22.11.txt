@@ -1,0 +1,762 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <ESPAsyncWebServer.h>
+#include <Preferences.h>
+#include <Firebase_ESP_Client.h>
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+#include <ArduinoJson.h>
+
+// ==================== CONFIGURATION ====================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+
+// Pin Definitions
+#define FLOW_SENSOR_PIN 27
+#define RELAY_PIN 19
+#define BATTERY_PIN 35  // NEW: Battery monitoring pin
+
+// ⚠️ IMPORTANT: SET THESE VALUES BEFORE FLASHING ⚠️
+#define DEVICE_ID "WM001"
+#define DEVICE_PASSWORD "PASS1234"
+
+// Firebase Configuration
+#define FIREBASE_HOST "your-project.firebaseio.com"
+#define FIREBASE_API_KEY "your-api-key"
+#define FIREBASE_DATABASE_URL "https://your-project.firebaseio.com"
+
+// AP Mode Configuration
+#define AP_SSID_PREFIX "SmartWM_"
+#define AP_WIFI_PASSWORD "12345678"
+#define AP_TIMEOUT 300000
+
+// Battery Configuration
+#define BATTERY_MIN_VOLTAGE 3.0
+#define BATTERY_MAX_VOLTAGE 4.2
+#define BATTERY_VOLTAGE_DIVIDER 2.0  // Adjust based on your voltage divider circuit
+
+// ==================== GLOBAL OBJECTS ====================
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+AsyncWebServer server(80);
+Preferences preferences;
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ==================== GLOBAL VARIABLES ====================
+String deviceId;
+String devicePassword;
+String wifiSSID;
+String wifiPassword;
+String firebaseUID;
+String firebaseToken;
+
+volatile int pulseCount = 0;
+float flowRate = 0.0;
+float totalLitres = 0.0;
+unsigned long oldTime = 0;
+bool valveState = false;
+
+// Battery monitoring
+int batteryPercentage = 0;
+float batteryVoltage = 0.0;
+unsigned long lastBatteryUpdate = 0;
+
+bool isConfigured = false;
+bool wifiConnected = false;
+bool firebaseConnected = false;
+unsigned long lastFirebaseUpdate = 0;
+unsigned long lastDisplayUpdate = 0;
+unsigned long apModeStartTime = 0;
+
+// Session management (for Direct AP)
+unsigned long sessionTimeout = 300000;
+unsigned long lastAuthTime = 0;
+bool isAuthenticated = false;
+String sessionToken = "";
+
+enum SystemState {
+  STATE_INIT,
+  STATE_AP_MODE,
+  STATE_CONNECTING,
+  STATE_CONNECTED,
+  STATE_ERROR
+};
+
+SystemState currentState = STATE_INIT;
+String statusMessage = "Initializing...";
+
+// ==================== INTERRUPT SERVICE ROUTINE ====================
+void IRAM_ATTR pulseCounter() {
+  pulseCount++;
+}
+
+// ==================== BATTERY MONITORING ====================
+void readBattery() {
+  // Read ADC value (0-4095 for 12-bit ADC)
+  int adcValue = analogRead(BATTERY_PIN);
+  
+  // Convert ADC to voltage (ESP32 ADC reference is 3.3V)
+  // Adjust for voltage divider if used
+  batteryVoltage = (adcValue / 4095.0) * 3.3 * BATTERY_VOLTAGE_DIVIDER;
+  
+  // Calculate percentage (linear approximation)
+  batteryPercentage = ((batteryVoltage - BATTERY_MIN_VOLTAGE) / 
+                       (BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE)) * 100.0;
+  
+  // Clamp between 0-100
+  if (batteryPercentage > 100) batteryPercentage = 100;
+  if (batteryPercentage < 0) batteryPercentage = 0;
+  
+  Serial.print("Battery: ");
+  Serial.print(batteryVoltage, 2);
+  Serial.print("V (");
+  Serial.print(batteryPercentage);
+  Serial.println("%)");
+}
+
+// ==================== DEVICE ID MANAGEMENT ====================
+String getDeviceId() {
+  return String(DEVICE_ID);
+}
+
+String getDevicePassword() {
+  return String(DEVICE_PASSWORD);
+}
+
+String generateSessionToken() {
+  String token = "";
+  for (int i = 0; i < 32; i++) {
+    token += String(random(0, 16), HEX);
+  }
+  return token;
+}
+
+bool verifyPassword(String password) {
+  return password == devicePassword;
+}
+
+bool isSessionValid() {
+  if (!isAuthenticated) return false;
+  if (millis() - lastAuthTime > sessionTimeout) {
+    isAuthenticated = false;
+    sessionToken = "";
+    return false;
+  }
+  return true;
+}
+
+// ==================== PREFERENCES MANAGEMENT ====================
+void loadPreferences() {
+  preferences.begin("watermon", false);
+  wifiSSID = preferences.getString("ssid", "");
+  wifiPassword = preferences.getString("password", "");
+  firebaseUID = preferences.getString("fbuid", "");
+  firebaseToken = preferences.getString("fbtoken", "");
+  totalLitres = preferences.getFloat("totalL", 0.0);
+  isConfigured = preferences.getBool("configured", false);
+  preferences.end();
+  
+  Serial.println("Loaded preferences:");
+  Serial.println("  Device ID: " + deviceId);
+  Serial.println("  SSID: " + wifiSSID);
+  Serial.println("  Configured: " + String(isConfigured));
+}
+
+void saveWiFiCredentials(String ssid, String password) {
+  preferences.begin("watermon", false);
+  preferences.putString("ssid", ssid);
+  preferences.putString("password", password);
+  preferences.putBool("configured", true);
+  preferences.end();
+  
+  wifiSSID = ssid;
+  wifiPassword = password;
+  isConfigured = true;
+}
+
+void saveFirebaseCredentials(String uid, String token) {
+  preferences.begin("watermon", false);
+  preferences.putString("fbuid", uid);
+  preferences.putString("fbtoken", token);
+  preferences.end();
+  
+  firebaseUID = uid;
+  firebaseToken = token;
+}
+
+void saveTotalLitres() {
+  preferences.begin("watermon", false);
+  preferences.putFloat("totalL", totalLitres);
+  preferences.end();
+}
+
+void resetConfiguration() {
+  preferences.begin("watermon", false);
+  preferences.remove("ssid");
+  preferences.remove("password");
+  preferences.remove("fbuid");
+  preferences.remove("fbtoken");
+  preferences.remove("configured");
+  preferences.end();
+  
+  wifiSSID = "";
+  wifiPassword = "";
+  firebaseUID = "";
+  firebaseToken = "";
+  isConfigured = false;
+}
+
+// ==================== DISPLAY FUNCTIONS ====================
+void initDisplay() {
+  Wire.begin(21, 22);
+  if (!display.begin(OLED_ADDR, true)) {
+    Serial.println(F("OLED init failed"));
+    while (1);
+  }
+  
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 10);
+  display.println("SmartWM");
+  display.display();
+  delay(2000);
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  
+  // Battery status at top
+  display.setCursor(0, 0);
+  display.print("Bat: ");
+  display.print(batteryPercentage);
+  display.print("% ");
+  display.print(batteryVoltage, 1);
+  display.println("V");
+  
+  // Flow rate
+  display.setCursor(0, 12);
+  display.print("Flow: ");
+  display.print(flowRate, 1);
+  display.println(" L/min");
+  
+  // Total usage
+  display.setCursor(0, 24);
+  display.print("Total: ");
+  display.print(totalLitres, 2);
+  display.println(" L");
+  
+  // Valve state
+  display.setCursor(0, 36);
+  display.print("Valve: ");
+  display.println(valveState ? "OPEN" : "CLOSED");
+  
+  // Connection status
+  display.setCursor(0, 54);
+  display.setTextSize(1);
+  if (currentState == STATE_AP_MODE) {
+    display.print("Setup: ");
+    display.print(AP_SSID_PREFIX);
+    display.print(deviceId);
+  } else if (currentState == STATE_CONNECTING) {
+    display.print("Connecting...");
+  } else if (firebaseConnected) {
+    display.print("Online");
+  } else if (wifiConnected) {
+    display.print("WiFi OK");
+  } else {
+    display.print(statusMessage);
+  }
+  
+  display.display();
+}
+
+void displayAPMode() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  
+  display.setCursor(0, 0);
+  display.println("=== SETUP MODE ===");
+  display.println("");
+  display.print("Device: ");
+  display.println(deviceId);
+  display.println("");
+  display.print("WiFi: ");
+  display.println(String(AP_SSID_PREFIX) + deviceId);
+  display.println("");
+  display.println("Connect & scan QR");
+  display.println("in mobile app");
+  
+  display.display();
+}
+
+// ==================== AP MODE WEB SERVER ====================
+void startAPMode() {
+  currentState = STATE_AP_MODE;
+  apModeStartTime = millis();
+  
+  String apSSID = String(AP_SSID_PREFIX) + deviceId;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apSSID.c_str(), AP_WIFI_PASSWORD);
+  
+  IPAddress IP = WiFi.softAPIP();
+  Serial.println("AP Mode Started");
+  Serial.println("SSID: " + apSSID);
+  Serial.println("Password: " + String(AP_WIFI_PASSWORD));
+  Serial.println("IP: " + IP.toString());
+  
+  statusMessage = "AP Mode";
+  displayAPMode();
+  
+  setupAPWebServer();
+}
+
+void setupAPWebServer() {
+  // CORS headers for all routes
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  
+  // Handle OPTIONS requests for CORS
+  server.on("/scan", HTTP_OPTIONS, [](AsyncWebServerRequest *request) {
+    request->send(200);
+  });
+  
+  server.on("/configure", HTTP_OPTIONS, [](AsyncWebServerRequest *request) {
+    request->send(200);
+  });
+  
+  // WiFi scan endpoint - FIXED to match React Native request
+  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("📡 WiFi scan request received");
+    
+    int n = WiFi.scanNetworks();
+    Serial.println("Found " + String(n) + " networks");
+    
+    StaticJsonDocument<4096> doc;
+    doc["success"] = true;
+    JsonArray networks = doc.createNestedArray("networks");
+    
+    for (int i = 0; i < n && i < 20; i++) {
+      JsonObject network = networks.createNestedObject();
+      network["ssid"] = WiFi.SSID(i);
+      network["rssi"] = WiFi.RSSI(i);
+      network["encryption"] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "OPEN" : "SECURED";
+      network["channel"] = WiFi.channel(i);
+      
+      Serial.print("  - ");
+      Serial.print(WiFi.SSID(i));
+      Serial.print(" (");
+      Serial.print(WiFi.RSSI(i));
+      Serial.println(" dBm)");
+    }
+    
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+  
+  // Configuration endpoint - FIXED: simplified, no Firebase required initially
+  server.on("/configure", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      Serial.println("📝 Configuration request received");
+      
+      StaticJsonDocument<512> doc;
+      DeserializationError error = deserializeJson(doc, data);
+      
+      if (error) {
+        Serial.println("❌ JSON parse error");
+        request->send(400, "application/json", "{\"success\":false,\"error\":\"Invalid JSON\"}");
+        return;
+      }
+      
+      String ssid = doc["ssid"] | "";
+      String password = doc["password"] | "";
+      
+      Serial.println("SSID: " + ssid);
+      Serial.println("Password: " + (password.length() > 0 ? "***" : "(empty)"));
+      
+      if (ssid.length() == 0) {
+        Serial.println("❌ SSID is required");
+        request->send(400, "application/json", "{\"success\":false,\"error\":\"SSID required\"}");
+        return;
+      }
+      
+      // Save WiFi credentials
+      saveWiFiCredentials(ssid, password);
+      
+      // Optional: Save Firebase credentials if provided (for future use)
+      if (doc.containsKey("uid") && doc.containsKey("token")) {
+        String uid = doc["uid"] | "";
+        String token = doc["token"] | "";
+        if (uid.length() > 0 && token.length() > 0) {
+          saveFirebaseCredentials(uid, token);
+          Serial.println("Firebase credentials saved");
+        }
+      }
+      
+      StaticJsonDocument<256> responseDoc;
+      responseDoc["success"] = true;
+      responseDoc["deviceId"] = deviceId;
+      responseDoc["message"] = "WiFi configuration saved successfully";
+      
+      String response;
+      serializeJson(responseDoc, response);
+      request->send(200, "application/json", response);
+      
+      Serial.println("✅ Configuration saved, restarting in 2 seconds...");
+      delay(2000);
+      ESP.restart();
+    });
+  
+  // Device info endpoint
+  server.on("/device-info", HTTP_GET, [](AsyncWebServerRequest *request) {
+    StaticJsonDocument<512> doc;
+    doc["success"] = true;
+    doc["deviceId"] = deviceId;
+    doc["version"] = "2.0.0";
+    doc["type"] = "smart-water-monitor";
+    doc["batteryPercentage"] = batteryPercentage;
+    doc["batteryVoltage"] = batteryVoltage;
+    doc["ip"] = WiFi.softAPIP().toString();
+    
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+  
+  server.begin();
+  Serial.println("✅ AP Web Server started");
+}
+
+// ==================== WIFI CONNECTION ====================
+bool connectToWiFi() {
+  if (wifiSSID.length() == 0) {
+    return false;
+  }
+  
+  currentState = STATE_CONNECTING;
+  statusMessage = "Connecting...";
+  updateDisplay();
+  
+  Serial.println("Connecting to WiFi: " + wifiSSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("\n✅ WiFi Connected");
+    Serial.println("IP: " + WiFi.localIP().toString());
+    Serial.println("RSSI: " + String(WiFi.RSSI()) + " dBm");
+    statusMessage = "WiFi OK";
+    return true;
+  } else {
+    wifiConnected = false;
+    Serial.println("\n❌ WiFi connection failed");
+    statusMessage = "WiFi Failed";
+    return false;
+  }
+}
+
+// ==================== FIREBASE SETUP ====================
+void setupFirebase() {
+  config.api_key = FIREBASE_API_KEY;
+  config.database_url = FIREBASE_DATABASE_URL;
+  
+  // Anonymous authentication for device (recommended for IoT devices)
+  Serial.println("Signing in anonymously...");
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("✅ Firebase anonymous auth successful");
+    firebaseUID = auth.token.uid;
+    saveFirebaseCredentials(firebaseUID, "");
+  } else {
+    Serial.println("❌ Firebase auth failed: " + String(config.signer.signupError.message.c_str()));
+  }
+  
+  config.token_status_callback = tokenStatusCallback;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  
+  fbdo.setBSSLBufferSize(2048, 1024);
+  fbdo.setResponseSize(2048);
+  
+  Serial.println("Firebase initialized");
+}
+
+void tokenStatusCallback(TokenInfo info) {
+  Serial.print("Token Status: ");
+  if (info.status == token_status_ready) {
+    Serial.println("Ready");
+    firebaseConnected = true;
+    currentState = STATE_CONNECTED;
+    
+    registerDeviceOwnership();
+    startFirebaseListeners();
+  } else if (info.status == token_status_error) {
+    Serial.println("Error");
+    Serial.println(info.error.message());
+    firebaseConnected = false;
+  }
+}
+
+// ==================== FIREBASE OPERATIONS ====================
+void registerDeviceOwnership() {
+  if (firebaseUID.length() == 0) return;
+  
+  String ownerPath = "/deviceOwners/" + deviceId;
+  
+  if (Firebase.RTDB.setString(&fbdo, ownerPath.c_str(), firebaseUID.c_str())) {
+    Serial.println("✅ Device ownership registered");
+  } else {
+    Serial.println("❌ Failed to register ownership: " + fbdo.errorReason());
+  }
+  
+  updateDeviceInfo();
+}
+
+void updateDeviceInfo() {
+  String infoPath = "/devices/" + deviceId + "/info";
+  FirebaseJson json;
+  json.set("deviceId", deviceId);
+  json.set("status", firebaseConnected ? "online" : "offline");
+  json.set("version", "2.0.0");
+  json.set("firmwareDate", __DATE__);
+  json.set("lastSeen", (int)millis());
+  json.set("batteryPercentage", batteryPercentage);
+  json.set("batteryVoltage", batteryVoltage);
+  
+  FirebaseJson wifiJson;
+  wifiJson.set("ssid", wifiSSID);
+  wifiJson.set("rssi", WiFi.RSSI());
+  wifiJson.set("ip", WiFi.localIP().toString());
+  json.set("wifiInfo", wifiJson);
+  
+  if (Firebase.RTDB.setJSON(&fbdo, infoPath.c_str(), &json)) {
+    Serial.println("✅ Device info updated");
+  } else {
+    Serial.println("❌ Device info update failed: " + fbdo.errorReason());
+  }
+}
+
+void startFirebaseListeners() {
+  String valvePath = "/devices/" + deviceId + "/commands/valveControl";
+  
+  if (!Firebase.RTDB.beginStream(&fbdo, valvePath.c_str())) {
+    Serial.println("❌ Valve stream begin failed: " + fbdo.errorReason());
+  } else {
+    Serial.println("✅ Valve control listener started");
+  }
+}
+
+void updateFirebaseData() {
+  if (!firebaseConnected) return;
+  
+  if (millis() - lastFirebaseUpdate < 3000) return;
+  
+  String dataPath = "/devices/" + deviceId + "/data";
+  
+  FirebaseJson json;
+  json.set("deviceId", deviceId);
+  json.set("userId", firebaseUID);
+  json.set("flowRate", flowRate);
+  json.set("totalLitres", totalLitres);
+  json.set("valveState", valveState ? "OPEN" : "CLOSED");
+  json.set("status", "online");
+  json.set("timestamp", (int)millis());
+  json.set("rssi", WiFi.RSSI());
+  json.set("batteryPercentage", batteryPercentage);
+  json.set("batteryVoltage", batteryVoltage);
+  
+  FirebaseJson wifiJson;
+  wifiJson.set("ssid", wifiSSID);
+  wifiJson.set("rssi", WiFi.RSSI());
+  wifiJson.set("ip", WiFi.localIP().toString());
+  json.set("wifiInfo", wifiJson);
+  
+  if (Firebase.RTDB.setJSON(&fbdo, dataPath.c_str(), &json)) {
+    Serial.println("✅ Data updated to Firebase");
+  } else {
+    Serial.println("❌ Firebase update failed: " + fbdo.errorReason());
+  }
+  
+  lastFirebaseUpdate = millis();
+}
+
+void checkFirebaseCommands() {
+  if (!firebaseConnected) return;
+  
+  if (!Firebase.RTDB.readStream(&fbdo)) return;
+  
+  if (fbdo.streamAvailable()) {
+    String streamPath = fbdo.streamPath();
+    
+    if (streamPath.indexOf("/valveControl") != -1) {
+      if (fbdo.dataType() == "boolean") {
+        bool command = fbdo.boolData();
+        Serial.println("🎛️ Valve command: " + String(command ? "OPEN" : "CLOSE"));
+        setValveState(command);
+        Firebase.RTDB.deleteNode(&fbdo, streamPath.c_str());
+      }
+    }
+  }
+  
+  checkOtherCommands();
+}
+
+void checkOtherCommands() {
+  String resetPath = "/devices/" + deviceId + "/commands/resetTotal";
+  if (Firebase.RTDB.getBool(&fbdo, resetPath.c_str())) {
+    if (fbdo.boolData() == true) {
+      totalLitres = 0.0;
+      saveTotalLitres();
+      Serial.println("🔄 Total litres reset");
+      Firebase.RTDB.deleteNode(&fbdo, resetPath.c_str());
+    }
+  }
+  
+  String wifiResetPath = "/devices/" + deviceId + "/commands/resetWifi";
+  if (Firebase.RTDB.getBool(&fbdo, wifiResetPath.c_str())) {
+    if (fbdo.boolData() == true) {
+      resetConfiguration();
+      Firebase.RTDB.deleteNode(&fbdo, wifiResetPath.c_str());
+      Serial.println("🔄 WiFi reset, restarting...");
+      ESP.restart();
+    }
+  }
+}
+
+// ==================== VALVE CONTROL ====================
+void setValveState(bool state) {
+  valveState = state;
+  digitalWrite(RELAY_PIN, state ? HIGH : LOW);
+  Serial.println("🚰 Valve set to: " + String(state ? "OPEN" : "CLOSED"));
+  updateDisplay();
+}
+
+// ==================== FLOW MEASUREMENT ====================
+void measureFlow() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - oldTime > 1000) {
+    detachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN));
+    
+    flowRate = (pulseCount / 7.5);
+    
+    float flowLitresPerSecond = flowRate / 60.0;
+    if (valveState && flowRate > 0.1) {
+      totalLitres += flowLitresPerSecond;
+    }
+    
+    static float lastSavedTotal = 0.0;
+    if (totalLitres - lastSavedTotal >= 10.0) {
+      saveTotalLitres();
+      lastSavedTotal = totalLitres;
+    }
+    
+    pulseCount = 0;
+    oldTime = currentTime;
+    
+    attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), pulseCounter, FALLING);
+  }
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\n╔════════════════════════════════════╗");
+  Serial.println("║   Smart Water Monitor v2.0       ║");
+  Serial.println("╚════════════════════════════════════╝\n");
+  
+  randomSeed(analogRead(0) + ESP.getCycleCount());
+  
+  deviceId = getDeviceId();
+  devicePassword = getDevicePassword();
+  Serial.println("🆔 Device ID: " + deviceId);
+  
+  // Configure pins
+  pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BATTERY_PIN, INPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  
+  // Configure ADC for battery reading
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), pulseCounter, FALLING);
+  
+  initDisplay();
+  loadPreferences();
+  readBattery();
+  
+  if (!isConfigured || wifiSSID.length() == 0) {
+    Serial.println("⚙️ Not configured - starting AP mode");
+    startAPMode();
+  } else {
+    Serial.println("⚙️ Configured - connecting to WiFi");
+    if (connectToWiFi()) {
+      setupFirebase();
+    } else {
+      Serial.println("❌ WiFi failed - starting AP mode for reconfiguration");
+      startAPMode();
+    }
+  }
+  
+  Serial.println("\n✅ Setup Complete\n");
+}
+
+// ==================== MAIN LOOP ====================
+void loop() {
+  // Handle AP mode timeout
+  if (currentState == STATE_AP_MODE) {
+    if (millis() - apModeStartTime > AP_TIMEOUT) {
+      Serial.println("⏱️ AP mode timeout - restarting");
+      ESP.restart();
+    }
+  }
+  
+  // WiFi reconnection
+  if (currentState == STATE_CONNECTED && WiFi.status() != WL_CONNECTED) {
+    Serial.println("📡 WiFi disconnected - reconnecting");
+    wifiConnected = false;
+    firebaseConnected = false;
+    connectToWiFi();
+  }
+  
+  // Read battery every 10 seconds
+  if (millis() - lastBatteryUpdate > 10000) {
+    readBattery();
+    lastBatteryUpdate = millis();
+  }
+  
+  // Measure flow
+  measureFlow();
+  
+  // Firebase operations
+  if (firebaseConnected) {
+    updateFirebaseData();
+    checkFirebaseCommands();
+  }
+  
+  // Update display every 500ms
+  if (millis() - lastDisplayUpdate > 500) {
+    updateDisplay();
+    lastDisplayUpdate = millis();
+  }
+  
+  delay(10);
+}

@@ -1,0 +1,261 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+
+    "users": {
+      "$userId": {
+        ".read": "auth != null && auth.uid == $userId",
+        ".write": "auth != null && auth.uid == $userId",
+        
+        "profile": {
+          ".read": "auth != null && auth.uid == $userId",
+          ".write": "auth != null && auth.uid == $userId"
+        },
+        
+        "devices": {
+          "$deviceId": {
+            ".read": "auth != null && auth.uid == $userId",
+            ".write": "auth != null && auth.uid == $userId",
+            ".validate": "newData.hasChildren(['deviceId', 'userId']) && newData.child('userId').val() == $userId"
+          }
+        }
+      }
+    },
+
+    "deviceOwners": {
+      "$deviceId": {
+        ".read": "auth != null",
+        ".write": "auth != null && (!data.exists() || data.val() == auth.uid)",
+        ".validate": "newData.isString() && newData.val().length > 0"
+      }
+    },
+
+    "devices": {
+      "$deviceId": {
+        ".read": "auth != null && (root.child('deviceOwners/' + $deviceId).val() == auth.uid || !root.child('deviceOwners/' + $deviceId).exists())",
+        ".write": "auth != null && (root.child('deviceOwners/' + $deviceId).val() == auth.uid || !root.child('deviceOwners/' + $deviceId).exists())",
+
+        "info": {
+          ".read": "auth != null && (root.child('deviceOwners/' + $deviceId).val() == auth.uid || !root.child('deviceOwners/' + $deviceId).exists())",
+          ".write": "auth != null && (root.child('deviceOwners/' + $deviceId).val() == auth.uid || !root.child('deviceOwners/' + $deviceId).exists())",
+          "deviceId": { 
+            ".validate": "newData.isString() && newData.val().length > 0" 
+          },
+          "status": { 
+            ".validate": "newData.isString() && newData.val().matches(/^(online|offline|setup|error)$/)" 
+          },
+          "version": { 
+            ".validate": "newData.isString()" 
+          },
+          "firmwareDate": {
+            ".validate": "newData.isString()"
+          },
+          "lastSeen": { 
+            ".validate": "newData.isNumber()" 
+          },
+          "batteryPercentage": {
+            ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 100"
+          },
+          "batteryVoltage": {
+            ".validate": "newData.isNumber() && newData.val() >= 0"
+          },
+          "wifiInfo": {
+            "ssid": { ".validate": "newData.isString()" },
+            "rssi": { ".validate": "newData.isNumber()" },
+            "ip": { ".validate": "newData.isString()" }
+          },
+          "$other": { 
+            ".validate": false 
+          }
+        },
+
+        "data": {
+          ".read": "auth != null && (root.child('deviceOwners/' + $deviceId).val() == auth.uid || !root.child('deviceOwners/' + $deviceId).exists())",
+          ".write": "auth != null && (root.child('deviceOwners/' + $deviceId).val() == auth.uid || !root.child('deviceOwners/' + $deviceId).exists())",
+          "deviceId": { 
+            ".validate": "newData.isString()" 
+          },
+          "userId": {
+            ".validate": "newData.isString()"
+          },
+          "flowRate": { 
+            ".validate": "newData.isNumber() && newData.val() >= 0" 
+          },
+          "totalLitres": { 
+            ".validate": "newData.isNumber() && newData.val() >= 0" 
+          },
+          "valveState": { 
+            ".validate": "newData.isString() && newData.val().matches(/^(OPEN|CLOSED|UNKNOWN)$/)" 
+          },
+          "status": { 
+            ".validate": "newData.isString()" 
+          },
+          "timestamp": { 
+            ".validate": "newData.isNumber()" 
+          },
+          "rssi": {
+            ".validate": "newData.isNumber()"
+          },
+          "batteryPercentage": {
+            ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 100"
+          },
+          "batteryVoltage": {
+            ".validate": "newData.isNumber() && newData.val() >= 0"
+          },
+          "wifiInfo": {
+            "ssid": { ".validate": "newData.isString()" },
+            "rssi": { ".validate": "newData.isNumber()" },
+            "ip": { ".validate": "newData.isString()" }
+          },
+          "$other": { 
+            ".validate": false 
+          }
+        },
+
+        "commands": {
+          ".read": "auth != null && root.child('deviceOwners/' + $deviceId).val() == auth.uid",
+          ".write": "auth != null && root.child('deviceOwners/' + $deviceId).val() == auth.uid",
+          
+          "scanWifi": {
+            ".validate": "newData.hasChildren(['scan', 'timestamp']) && newData.child('scan').isBoolean() && newData.child('timestamp').isNumber()"
+          },
+          
+          "resetWifi": { 
+            ".validate": "newData.isBoolean()" 
+          },
+          
+          "valveControl": { 
+            ".validate": "newData.isBoolean()" 
+          },
+          
+          "resetTotal": { 
+            ".validate": "newData.isBoolean()" 
+          },
+          
+          "$other": { 
+            ".validate": false 
+          }
+        },
+
+        "wifiScan": {
+          ".read": "auth != null && (root.child('deviceOwners/' + $deviceId).val() == auth.uid || !root.child('deviceOwners/' + $deviceId).exists())",
+          ".write": "auth != null && (root.child('deviceOwners/' + $deviceId).val() == auth.uid || !root.child('deviceOwners/' + $deviceId).exists())",
+          
+          "scanning": { 
+            ".validate": "newData.isBoolean()" 
+          },
+          
+          "networks": {
+            "$networkId": {
+              "ssid": { 
+                ".validate": "newData.isString() && newData.val().length > 0" 
+              },
+              "rssi": { 
+                ".validate": "newData.isNumber()" 
+              },
+              "encryption": { 
+                ".validate": "newData.isString() && newData.val().matches(/^(OPEN|SECURED)$/)" 
+              },
+              "channel": { 
+                ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 14" 
+              },
+              "$other": { 
+                ".validate": false 
+              }
+            }
+          },
+          
+          "$other": { 
+            ".validate": false 
+          }
+        },
+
+        "wifiConfig": {
+          ".read": "auth != null && (root.child('deviceOwners/' + $deviceId).val() == auth.uid || !root.child('deviceOwners/' + $deviceId).exists())",
+          ".write": "auth != null && (root.child('deviceOwners/' + $deviceId).val() == auth.uid || !root.child('deviceOwners/' + $deviceId).exists())",
+          
+          "ssid": { 
+            ".validate": "newData.isString() && newData.val().length > 0"
+          },
+          "password": { 
+            ".validate": "newData.isString()" 
+          },
+          "timestamp": { 
+            ".validate": "newData.isNumber()" 
+          },
+          "configured": { 
+            ".validate": "newData.isBoolean()" 
+          },
+          "error": { 
+            ".validate": "newData.isString()" 
+          },
+          
+          "$other": { 
+            ".validate": false 
+          }
+        },
+
+        "$other": { 
+          ".validate": false 
+        }
+      }
+    },
+
+    "history": {
+      "$deviceId": {
+        ".read": "auth != null && root.child('deviceOwners/' + $deviceId).val() == auth.uid",
+        ".write": "auth != null && root.child('deviceOwners/' + $deviceId).val() == auth.uid",
+        
+        "$recordId": {
+          "timestamp": { 
+            ".validate": "newData.isNumber()" 
+          },
+          "flowRate": { 
+            ".validate": "newData.isNumber() && newData.val() >= 0" 
+          },
+          "totalLitres": { 
+            ".validate": "newData.isNumber() && newData.val() >= 0" 
+          },
+          "valveState": { 
+            ".validate": "newData.isString()" 
+          },
+          "batteryPercentage": {
+            ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 100"
+          },
+          "$other": { 
+            ".validate": false 
+          }
+        }
+      }
+    },
+
+    "analytics": {
+      "$deviceId": {
+        ".read": "auth != null && root.child('deviceOwners/' + $deviceId).val() == auth.uid",
+        ".write": "auth != null && root.child('deviceOwners/' + $deviceId).val() == auth.uid",
+        
+        "$recordId": {
+          "date": { 
+            ".validate": "newData.isString()" 
+          },
+          "totalUsage": { 
+            ".validate": "newData.isNumber() && newData.val() >= 0" 
+          },
+          "averageFlow": { 
+            ".validate": "newData.isNumber() && newData.val() >= 0" 
+          },
+          "peakFlow": { 
+            ".validate": "newData.isNumber() && newData.val() >= 0" 
+          },
+          "duration": { 
+            ".validate": "newData.isNumber() && newData.val() >= 0" 
+          },
+          "$other": { 
+            ".validate": false 
+          }
+        }
+      }
+    }
+  }
+}
